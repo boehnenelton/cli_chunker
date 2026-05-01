@@ -1,0 +1,1832 @@
+--- FILE: bejson_core.ts ---
+/**
+ * Library:     bejson_core.ts
+ * Jurisdiction: ["TYPESCRIPT", "CORE_COMMAND"]
+ * Status:      OFFICIAL — Core-Command/Lib (v1.1)
+ * Author:      Elton Boehnen
+ * Version:     1.1 (OFFICIAL)
+ * Date:        2026-04-23
+ * Description: Core-Command library component.
+ */
+import {
+  BEJSONDocument,
+  BEJSONField,
+  BEJSONValue,
+  BEJSONCoreError,
+  BEJSON_CORE_CODES,
+} from "./bejson_types";
+
+// ---------------------------------------------------------------------------
+// Parse & Serialize
+// ---------------------------------------------------------------------------
+
+
+export function parse(json: string): BEJSONDocument {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(json);
+  } catch (e) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.PARSE_ERROR,
+      "Invalid JSON: " + String(e)
+    );
+  }
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.PARSE_ERROR,
+      "Parsed JSON root must be an object."
+    );
+  }
+  return raw as BEJSONDocument;
+}
+
+
+export function serialize(doc: BEJSONDocument, indent: number = 2): string {
+  if (doc === null || doc === undefined) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.NULL_DOCUMENT,
+      "Cannot serialize null or undefined document."
+    );
+  }
+  try {
+    return JSON.stringify(doc, null, indent || undefined);
+  } catch (e) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.SERIALIZATION_ERROR,
+      "Serialization failed: " + String(e)
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Field index helpers
+// ---------------------------------------------------------------------------
+
+
+export function getFieldIndex(doc: BEJSONDocument, name: string): number {
+  _assertDoc(doc);
+  const idx = doc.Fields.findIndex((f) => f.name === name);
+  if (idx === -1) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.FIELD_NOT_FOUND,
+      "Field not found: " + name
+    );
+  }
+  return idx;
+}
+
+
+export function getFieldNames(doc: BEJSONDocument): string[] {
+  _assertDoc(doc);
+  return doc.Fields.map((f) => f.name);
+}
+
+
+export function getFields(doc: BEJSONDocument): BEJSONField[] {
+  _assertDoc(doc);
+  return doc.Fields.map((f) => Object.assign({}, f));
+}
+
+// ---------------------------------------------------------------------------
+// Record accessors
+// ---------------------------------------------------------------------------
+
+
+export function getRecord(
+  doc: BEJSONDocument,
+  index: number
+): Record<string, BEJSONValue> {
+  _assertDoc(doc);
+  _assertIndex(doc, index);
+  return _rowToObject(doc.Fields, doc.Values[index]);
+}
+
+
+export function getAllRecords(
+  doc: BEJSONDocument
+): Record<string, BEJSONValue>[] {
+  _assertDoc(doc);
+  return doc.Values.map((row) => _rowToObject(doc.Fields, row));
+}
+
+
+export function getFieldValue(
+  doc: BEJSONDocument,
+  index: number,
+  fieldName: string
+): BEJSONValue {
+  _assertDoc(doc);
+  _assertIndex(doc, index);
+  const fi = getFieldIndex(doc, fieldName);
+  return doc.Values[index][fi];
+}
+
+
+export function getRecordCount(doc: BEJSONDocument): number {
+  _assertDoc(doc);
+  return doc.Values.length;
+}
+
+// ---------------------------------------------------------------------------
+// 104db — entity-scoped record access
+// ---------------------------------------------------------------------------
+
+
+export function getRecordsByType(
+  doc: BEJSONDocument,
+  type: string
+): Record<string, BEJSONValue>[] {
+  _assertDoc(doc);
+  if (doc.Format_Version !== "104db") {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.UNSUPPORTED_OPERATION,
+      "getRecordsByType is only valid on BEJSON 104db documents."
+    );
+  }
+  // In 104db, the first field MUST be Record_Type_Parent (index 0)
+  return doc.Values.filter((row) => row[0] === type).map((row) =>
+    _rowToObject(doc.Fields, row)
+  );
+}
+
+
+export function getFieldApplicability(
+  doc: BEJSONDocument,
+  fieldName: string
+): string {
+  _assertDoc(doc);
+  const field = doc.Fields.find((f) => f.name === fieldName);
+  if (!field) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.FIELD_NOT_FOUND,
+      `Field not found: ${fieldName}`
+    );
+  }
+
+  const rtp = field.Record_Type_Parent;
+  if (doc.Format_Version === "104db") {
+    if (!rtp) {
+      if ((field as any).applies_to) {
+        throw new BEJSONCoreError(
+          BEJSON_CORE_CODES.UNSUPPORTED_OPERATION,
+          `Field '${fieldName}' uses legacy 'applies_to'. 104db requires 'Record_Type_Parent'.`
+        );
+      }
+      throw new BEJSONCoreError(
+        BEJSON_CORE_CODES.UNSUPPORTED_OPERATION,
+        `Field '${fieldName}' missing Record_Type_Parent in 104db`
+      );
+    }
+  }
+  return rtp || "common";
+}
+
+
+export function queryRecords(
+  doc: BEJSONDocument,
+  fieldName: string,
+  searchValue: BEJSONValue
+): Record<string, BEJSONValue>[] {
+  _assertDoc(doc);
+  const idx = getFieldIndex(doc, fieldName);
+  return doc.Values.filter((row) => row[idx] === searchValue).map((row) =>
+    _rowToObject(doc.Fields, row)
+  );
+}
+
+
+export function sortByField(
+  doc: BEJSONDocument,
+  fieldName: string,
+  ascending: boolean = true
+): BEJSONDocument {
+  _assertDoc(doc);
+  const idx = getFieldIndex(doc, fieldName);
+  const sortedValues = [...doc.Values].sort((a, b) => {
+    const valA = a[idx];
+    const valB = b[idx];
+    if (valA === valB) return 0;
+    if (valA === null) return 1;
+    if (valB === null) return -1;
+    
+    let comparison = 0;
+    if (typeof valA === 'string' && typeof valB === 'string') {
+      comparison = valA.localeCompare(valB);
+    } else {
+      comparison = (valA as any) < (valB as any) ? -1 : 1;
+    }
+    return ascending ? comparison : -comparison;
+  });
+
+  return _cloneWith(doc, { Values: sortedValues });
+}
+
+
+export function getEntityFields(
+  doc: BEJSONDocument,
+  entityName: string
+): BEJSONField[] {
+  _assertDoc(doc);
+  if (doc.Format_Version !== "104db") {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.UNSUPPORTED_OPERATION,
+      "getEntityFields is only valid on BEJSON 104db documents."
+    );
+  }
+  return doc.Fields.filter(
+    (f) => f.name !== "Record_Type_Parent" && f.Record_Type_Parent === entityName
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Record mutations (return new document — documents are treated as immutable)
+// ---------------------------------------------------------------------------
+
+
+export function appendRecord(
+  doc: BEJSONDocument,
+  values: BEJSONValue[]
+): BEJSONDocument {
+  _assertDoc(doc);
+  _assertRowLength(doc, values);
+  const coerced = values.map((v, i) => _coerceValue(v, doc.Fields[i].type));
+  return _cloneWith(doc, { Values: [...doc.Values, coerced] });
+}
+
+
+export function updateRecord(
+  doc: BEJSONDocument,
+  index: number,
+  values: BEJSONValue[]
+): BEJSONDocument {
+  _assertDoc(doc);
+  _assertIndex(doc, index);
+  _assertRowLength(doc, values);
+  const coerced = values.map((v, i) => _coerceValue(v, doc.Fields[i].type));
+  const newValues = doc.Values.map((row, i) =>
+    i === index ? coerced : row
+  );
+  return _cloneWith(doc, { Values: newValues });
+}
+
+
+export function setFieldValue(
+  doc: BEJSONDocument,
+  index: number,
+  fieldName: string,
+  value: BEJSONValue
+): BEJSONDocument {
+  _assertDoc(doc);
+  _assertIndex(doc, index);
+  const fi = getFieldIndex(doc, fieldName);
+  const coerced = _coerceValue(value, doc.Fields[fi].type);
+  const newValues = doc.Values.map((row, i) => {
+    if (i !== index) return row;
+    const newRow = [...row];
+    newRow[fi] = coerced;
+    return newRow;
+  });
+  return _cloneWith(doc, { Values: newValues });
+}
+
+
+export function deleteRecord(
+  doc: BEJSONDocument,
+  index: number
+): BEJSONDocument {
+  _assertDoc(doc);
+  _assertIndex(doc, index);
+  const newValues = doc.Values.filter((_, i) => i !== index);
+  return _cloneWith(doc, { Values: newValues });
+}
+
+// ---------------------------------------------------------------------------
+// Schema mutations
+// ---------------------------------------------------------------------------
+
+
+export function appendField(
+  doc: BEJSONDocument,
+  field: BEJSONField,
+  defaultValue: BEJSONValue = null
+): BEJSONDocument {
+  _assertDoc(doc);
+  if (doc.Fields.some((f) => f.name === field.name)) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.WRITE_LENGTH_MISMATCH,
+      "Field already exists: " + field.name
+    );
+  }
+  const newFields = [...doc.Fields, { ...field }];
+  const newValues = doc.Values.map((row) => [...row, defaultValue]);
+  return _cloneWith(doc, { Fields: newFields, Values: newValues });
+}
+
+// ---------------------------------------------------------------------------
+// Document factory helpers
+// ---------------------------------------------------------------------------
+
+
+export function createEmpty104(
+  recordType: string,
+  fields: BEJSONField[],
+  parentHierarchy?: string
+): BEJSONDocument {
+  const doc: BEJSONDocument = {
+    Format: "BEJSON",
+    Format_Version: "104",
+    Format_Creator: "Elton Boehnen",
+    Records_Type: [recordType],
+    Fields: fields.map((f) => ({ ...f })),
+    Values: [],
+  };
+  if (parentHierarchy !== undefined) {
+    doc.Parent_Hierarchy = parentHierarchy;
+  }
+  return doc;
+}
+
+
+export function createEmpty104a(
+  recordType: string,
+  fields: BEJSONField[],
+  customHeaders: Record<string, string | number | boolean> = {}
+): BEJSONDocument {
+  const doc: BEJSONDocument = {
+    Format: "BEJSON",
+    Format_Version: "104a",
+    Format_Creator: "Elton Boehnen",
+    ...customHeaders,
+    Records_Type: [recordType],
+    Fields: fields.map((f) => ({ ...f })),
+    Values: [],
+  };
+  return doc;
+}
+
+
+export function createEmpty104db(
+  recordTypes: string[],
+  entityFields: BEJSONField[]
+): BEJSONDocument {
+  const discriminator: BEJSONField = {
+    name: "Record_Type_Parent",
+    type: "string",
+  };
+  return {
+    Format: "BEJSON",
+    Format_Version: "104db",
+    Format_Creator: "Elton Boehnen",
+    Records_Type: [...recordTypes],
+    Fields: [discriminator, ...entityFields.map((f) => ({ ...f }))],
+    Values: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Utility — flatten a record for 104db (strip discriminator, nulled fields)
+// ---------------------------------------------------------------------------
+
+
+export function flattenEntityRecord(
+  doc: BEJSONDocument,
+  record: Record<string, BEJSONValue>
+): Record<string, BEJSONValue> {
+  if (doc.Format_Version !== "104db") {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.UNSUPPORTED_OPERATION,
+      "flattenEntityRecord is only valid on BEJSON 104db documents."
+    );
+  }
+  const entityName = record["Record_Type_Parent"] as string;
+  const result: Record<string, BEJSONValue> = {};
+  for (const field of doc.Fields) {
+    if (field.name === "Record_Type_Parent") continue;
+    if (field.Record_Type_Parent === entityName) {
+      result[field.name] = record[field.name];
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+function _assertDoc(doc: BEJSONDocument): void {
+  if (doc === null || doc === undefined) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.NULL_DOCUMENT,
+      "Document is null or undefined."
+    );
+  }
+}
+
+function _assertIndex(doc: BEJSONDocument, index: number): void {
+  if (index < 0 || index >= doc.Values.length) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.INDEX_OUT_OF_BOUNDS,
+      "Record index " + index + " is out of bounds (length " + doc.Values.length + ")."
+    );
+  }
+}
+
+function _assertRowLength(doc: BEJSONDocument, values: BEJSONValue[]): void {
+  if (values.length !== doc.Fields.length) {
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.WRITE_LENGTH_MISMATCH,
+      "Row length " + values.length + " does not match Fields length " + doc.Fields.length + "."
+    );
+  }
+}
+
+function _rowToObject(
+  fields: BEJSONField[],
+  row: BEJSONValue[]
+): Record<string, BEJSONValue> {
+  const obj: Record<string, BEJSONValue> = {};
+  for (let i = 0; i < fields.length; i++) {
+    obj[fields[i].name] = row[i];
+  }
+  return obj;
+}
+
+function _cloneWith(
+  doc: BEJSONDocument,
+  overrides: Partial<BEJSONDocument>
+): BEJSONDocument {
+  return Object.assign({}, doc, overrides);
+}
+
+function _coerceValue(value: any, fieldType: string): BEJSONValue {
+  if (fieldType === "string") return String(value);
+  if (fieldType === "integer" || fieldType === "number") {
+    const num =
+      fieldType === "integer" ? parseInt(value, 10) : parseFloat(value);
+    if (isNaN(num)) {
+      throw new BEJSONCoreError(
+        BEJSON_CORE_CODES.WRITE_TYPE_MISMATCH,
+        `Cannot convert '${value}' to ${fieldType}`
+      );
+    }
+    return num;
+  }
+  if (fieldType === "boolean") {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "string") {
+      if (value.toLowerCase() === "true") return true;
+      if (value.toLowerCase() === "false") return false;
+    }
+    throw new BEJSONCoreError(
+      BEJSON_CORE_CODES.WRITE_TYPE_MISMATCH,
+      `Cannot convert '${value}' to boolean`
+    );
+  }
+  return value as BEJSONValue;
+}
+
+
+
+--- FILE: bejson_types.ts ---
+/**
+ * Library:     bejson_types.ts
+ * Jurisdiction: ["TYPESCRIPT", "CORE_COMMAND"]
+ * Status:      OFFICIAL — Core-Command/Lib (v1.1)
+ * Author:      Elton Boehnen
+ * Version:     1.1 (OFFICIAL)
+ * Date:        2026-04-23
+ * Description: Core-Command library component.
+ */
+// ---------------------------------------------------------------------------
+// Primitive and union types
+// ---------------------------------------------------------------------------
+
+export type BEJSONVersion = "104" | "104a" | "104db";
+
+
+export type BEJSONFieldType =
+  | "string"
+  | "integer"
+  | "number"
+  | "boolean"
+  | "array"
+  | "object";
+
+
+export type BEJSONPrimitiveType = "string" | "integer" | "number" | "boolean";
+
+
+export type BEJSONValue =
+  | string
+  | number
+  | boolean
+  | null
+  | unknown[]
+  | Record<string, unknown>;
+
+// ---------------------------------------------------------------------------
+// Field and Document interfaces
+// ---------------------------------------------------------------------------
+
+export interface BEJSONField {
+  name: string;
+  type: BEJSONFieldType;
+  
+  Record_Type_Parent?: string;
+}
+
+
+export interface BEJSONDocument {
+  Format: "BEJSON";
+  Format_Version: BEJSONVersion;
+  Format_Creator: "Elton Boehnen";
+  Records_Type: string[];
+  Fields: BEJSONField[];
+  Values: BEJSONValue[][];
+  
+  Parent_Hierarchy?: string;
+  [key: string]: unknown; // custom 104a headers + index access
+}
+
+// ---------------------------------------------------------------------------
+// Validation result types
+// ---------------------------------------------------------------------------
+
+export interface ValidationError {
+  code: number;
+  message: string;
+  field?: string;
+  recordIndex?: number;
+}
+
+export interface ValidationWarning {
+  code: number;
+  message: string;
+  field?: string;
+  recordIndex?: number;
+}
+
+export interface ValidationResult {
+  valid: boolean;
+  errors: ValidationError[];
+  warnings: ValidationWarning[];
+}
+
+// ---------------------------------------------------------------------------
+// MFDB-specific interfaces
+// ---------------------------------------------------------------------------
+
+
+export interface MFDBManifestRecord {
+  entity_name: string;
+  file_path: string;
+  description?: string | null;
+  record_count?: number | null;
+  schema_version?: string | null;
+  primary_key?: string | null;
+}
+
+
+export interface MFDBDatabaseMeta {
+  mfdb_version: string;
+  db_name: string;
+  db_description?: string;
+  schema_version?: string;
+  author?: string;
+  created_at?: string;
+}
+
+
+export type MFDBFileRole = "manifest" | "entity" | "standalone";
+
+// ---------------------------------------------------------------------------
+// Error classes
+// ---------------------------------------------------------------------------
+
+
+export class BEJSONValidationError extends Error {
+  public readonly code: number;
+  constructor(code: number, message: string) {
+    super(message);
+    this.name = "BEJSONValidationError";
+    this.code = code;
+  }
+}
+
+
+export class BEJSONCoreError extends Error {
+  public readonly code: number;
+  constructor(code: number, message: string) {
+    super(message);
+    this.name = "BEJSONCoreError";
+    this.code = code;
+  }
+}
+
+
+export class MFDBValidationError extends Error {
+  public readonly code: number;
+  constructor(code: number, message: string) {
+    super(message);
+    this.name = "MFDBValidationError";
+    this.code = code;
+  }
+}
+
+
+export class MFDBCoreError extends Error {
+  public readonly code: number;
+  constructor(code: number, message: string) {
+    super(message);
+    this.name = "MFDBCoreError";
+    this.code = code;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Validation error code catalogue
+// ---------------------------------------------------------------------------
+
+export const BEJSON_VALIDATION_CODES = {
+  
+  INVALID_JSON: 1,
+  
+  MISSING_MANDATORY_KEY: 2,
+  
+  INVALID_FORMAT_VALUE: 3,
+  
+  INVALID_FORMAT_VERSION: 4,
+  
+  INVALID_FORMAT_CREATOR: 5,
+  
+  INVALID_RECORDS_TYPE: 6,
+  
+  INVALID_FIELDS: 7,
+  
+  DUPLICATE_FIELD_NAME: 8,
+  
+  INVALID_VALUES_STRUCTURE: 9,
+  
+  RECORD_LENGTH_MISMATCH: 10,
+  
+  VALUE_TYPE_MISMATCH: 11,
+  
+  VERSION_CONSTRAINT: 12,
+  
+  FORBIDDEN_CUSTOM_KEY: 13,
+  
+  INVALID_CUSTOM_KEY: 14,
+  
+  MISSING_DISCRIMINATOR: 15,
+} as const;
+
+export const BEJSON_CORE_CODES = {
+  
+  NULL_DOCUMENT: 20,
+  
+  INDEX_OUT_OF_BOUNDS: 21,
+  
+  FIELD_NOT_FOUND: 22,
+  
+  WRITE_LENGTH_MISMATCH: 23,
+  
+  SERIALIZATION_ERROR: 24,
+  
+  PARSE_ERROR: 25,
+  
+  WRITE_TYPE_MISMATCH: 26,
+  
+  UNSUPPORTED_OPERATION: 27,
+} as const;
+
+export const MFDB_VALIDATION_CODES = {
+  
+  NOT_A_MANIFEST: 30,
+  
+  NOT_AN_ENTITY: 31,
+  
+  MANIFEST_RECORDS_TYPE_INVALID: 32,
+  
+  ENTITY_FILE_NOT_FOUND: 33,
+  
+  ENTITY_NAME_MISMATCH: 34,
+  
+  DUPLICATE_ENTRY: 35,
+  
+  MISSING_PARENT_HIERARCHY: 36,
+  
+  MANIFEST_FILE_NOT_FOUND: 37,
+  
+  BIDIRECTIONAL_PATH_FAILED: 38,
+  
+  FK_UNRESOLVED: 39,
+  
+  MISSING_REQUIRED_MANIFEST_FIELD: 40,
+  
+  NULL_IN_REQUIRED_MANIFEST_FIELD: 41,
+} as const;
+
+export const MFDB_CORE_CODES = {
+  
+  NULL_MANIFEST: 50,
+  
+  NULL_ENTITY: 51,
+  
+  INVALID_MFDB_VERSION: 52,
+  
+  MISSING_DB_NAME: 53,
+  
+  ENTITY_NOT_IN_MANIFEST: 54,
+  
+  MANIFEST_READONLY: 55,
+  
+  SCHEMA_VERSION_CONFLICT: 56,
+  
+  RECORD_COUNT_SYNC_FAILED: 57,
+  
+  DUPLICATE_ENTITY_NAME: 58,
+} as const;
+
+
+
+--- FILE: bejson_validators.ts ---
+/**
+ * Library:     bejson_validators.ts
+ * Jurisdiction: ["TYPESCRIPT", "CORE_COMMAND"]
+ * Status:      OFFICIAL — Core-Command/Lib (v1.1)
+ * Author:      Elton Boehnen
+ * Version:     1.1 (OFFICIAL)
+ * Date:        2026-04-23
+ * Description: Core-Command library component.
+ */
+import {
+  BEJSONDocument,
+  BEJSONField,
+  BEJSONFieldType,
+  BEJSONPrimitiveType,
+  BEJSONValue,
+  ValidationResult,
+  ValidationError,
+  ValidationWarning,
+  BEJSONValidationError,
+  BEJSON_VALIDATION_CODES as E,
+} from "./bejson_types";
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+
+export function validateDocument(doc: unknown): ValidationResult {
+  const result = _makeResult();
+
+  // Step 1: structural sanity before touching any BEJSON fields
+  if (doc === null || doc === undefined || typeof doc !== "object" || Array.isArray(doc)) {
+    _err(result, E.INVALID_FORMAT_VALUE, "Document root must be a non-null object.");
+    return result;
+  }
+
+  const d = doc as Record<string, unknown>;
+
+  // Step 2: mandatory keys
+  _checkMandatoryKeys(d, result);
+  if (!result.valid) return result; // can't proceed without the six keys
+
+  const bej = doc as BEJSONDocument;
+
+  // Step 3: top-level value checks (Format, Format_Creator, Format_Version)
+  _checkTopLevel(bej, result);
+  if (!result.valid) return result;
+
+  // Step 4: Fields array
+  _checkFields(bej, result);
+  if (!result.valid) return result;
+
+  // Step 5: Values array
+  _checkValues(bej, result);
+
+  // Step 6: version-specific rules
+  switch (bej.Format_Version) {
+    case "104":
+      _check104Specific(bej, result);
+      break;
+    case "104a":
+      _check104aSpecific(bej, result);
+      break;
+    case "104db":
+      _check104dbSpecific(bej, result);
+      break;
+  }
+
+  return result;
+}
+
+
+export function validate104(doc: unknown): ValidationResult {
+  const result = validateDocument(doc);
+  if (result.valid) {
+    const bej = doc as BEJSONDocument;
+    if (bej.Format_Version !== "104") {
+      _err(result, E.INVALID_FORMAT_VERSION, "Expected Format_Version \"104\", got \"" + bej.Format_Version + "\".");
+    }
+  }
+  return result;
+}
+
+
+export function validate104a(doc: unknown): ValidationResult {
+  const result = validateDocument(doc);
+  if (result.valid) {
+    const bej = doc as BEJSONDocument;
+    if (bej.Format_Version !== "104a") {
+      _err(result, E.INVALID_FORMAT_VERSION, "Expected Format_Version \"104a\", got \"" + bej.Format_Version + "\".");
+    }
+  }
+  return result;
+}
+
+
+export function validate104db(doc: unknown): ValidationResult {
+  const result = validateDocument(doc);
+  if (result.valid) {
+    const bej = doc as BEJSONDocument;
+    if (bej.Format_Version !== "104db") {
+      _err(result, E.INVALID_FORMAT_VERSION, "Expected Format_Version \"104db\", got \"" + bej.Format_Version + "\".");
+    }
+  }
+  return result;
+}
+
+
+export function assertValid(doc: unknown): void {
+  const result = validateDocument(doc);
+  if (!result.valid && result.errors.length > 0) {
+    const e = result.errors[0];
+    throw new BEJSONValidationError(e.code, e.message);
+  }
+}
+
+
+export function isValid(doc: unknown): boolean {
+  return validateDocument(doc).valid;
+}
+
+// ---------------------------------------------------------------------------
+// Step 2 — mandatory keys
+// ---------------------------------------------------------------------------
+
+const MANDATORY_KEYS = ["Format", "Format_Version", "Format_Creator", "Records_Type", "Fields", "Values"] as const;
+
+function _checkMandatoryKeys(d: Record<string, unknown>, r: ValidationResult): void {
+  for (const key of MANDATORY_KEYS) {
+    if (!(key in d) || d[key] === undefined) {
+      _err(r, E.MISSING_MANDATORY_KEY, "Missing mandatory key: " + key, key);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 3 — top-level value constraints
+// ---------------------------------------------------------------------------
+
+function _checkTopLevel(doc: BEJSONDocument, r: ValidationResult): void {
+  if (doc.Format !== "BEJSON") {
+    _err(r, E.INVALID_FORMAT_VALUE, "Format must be \"BEJSON\", got \"" + doc.Format + "\".", "Format");
+  }
+
+  const validVersions = ["104", "104a", "104db"];
+  if (!validVersions.includes(doc.Format_Version as string)) {
+    _err(r, E.INVALID_FORMAT_VERSION, "Unknown Format_Version: \"" + doc.Format_Version + "\".", "Format_Version");
+  }
+
+  if (doc.Format_Creator !== "Elton Boehnen") {
+    _err(r, E.INVALID_FORMAT_CREATOR, "Format_Creator must be \"Elton Boehnen\", got \"" + doc.Format_Creator + "\".", "Format_Creator");
+  }
+
+  if (!Array.isArray(doc.Records_Type) || doc.Records_Type.length === 0) {
+    _err(r, E.INVALID_RECORDS_TYPE, "Records_Type must be a non-empty array.", "Records_Type");
+  } else {
+    for (const rt of doc.Records_Type) {
+      if (typeof rt !== "string" || rt.trim() === "") {
+        _err(r, E.INVALID_RECORDS_TYPE, "All Records_Type entries must be non-empty strings.", "Records_Type");
+        break;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 4 — Fields array
+// ---------------------------------------------------------------------------
+
+const VALID_TYPES: BEJSONFieldType[] = ["string", "integer", "number", "boolean", "array", "object"];
+
+function _checkFields(doc: BEJSONDocument, r: ValidationResult): void {
+  if (!Array.isArray(doc.Fields) || doc.Fields.length === 0) {
+    _err(r, E.INVALID_FIELDS, "Fields must be a non-empty array.", "Fields");
+    return;
+  }
+
+  const seen = new Set<string>();
+  for (let i = 0; i < doc.Fields.length; i++) {
+    const field = doc.Fields[i] as BEJSONField;
+
+    if (!field || typeof field !== "object") {
+      _err(r, E.INVALID_FIELDS, "Fields[" + i + "] must be an object.", "Fields");
+      continue;
+    }
+    if (typeof field.name !== "string" || field.name.trim() === "") {
+      _err(r, E.INVALID_FIELDS, "Fields[" + i + "].name must be a non-empty string.", "Fields");
+    }
+    if (!VALID_TYPES.includes(field.type as BEJSONFieldType)) {
+      _err(r, E.INVALID_FIELDS, "Fields[" + i + "].type is invalid: \"" + field.type + "\".", "Fields");
+    }
+    if (seen.has(field.name)) {
+      _err(r, E.DUPLICATE_FIELD_NAME, "Duplicate field name: \"" + field.name + "\".", field.name);
+    } else {
+      seen.add(field.name);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 5 — Values array
+// ---------------------------------------------------------------------------
+
+function _checkValues(doc: BEJSONDocument, r: ValidationResult): void {
+  if (!Array.isArray(doc.Values)) {
+    _err(r, E.INVALID_VALUES_STRUCTURE, "Values must be an array.", "Values");
+    return;
+  }
+
+  const fieldCount = doc.Fields.length;
+
+  for (let i = 0; i < doc.Values.length; i++) {
+    const row = doc.Values[i];
+    if (!Array.isArray(row)) {
+      _err(r, E.INVALID_VALUES_STRUCTURE, "Values[" + i + "] must be an array.", undefined, i);
+      continue;
+    }
+    if (row.length !== fieldCount) {
+      _err(r, E.RECORD_LENGTH_MISMATCH,
+        "Values[" + i + "] has " + row.length + " elements but Fields has " + fieldCount + ".",
+        undefined, i);
+      continue;
+    }
+
+    // Type-check each cell
+    for (let fi = 0; fi < fieldCount; fi++) {
+      const field = doc.Fields[fi];
+      const val = row[fi];
+      if (val === null) continue; // null always valid
+      if (!_typeMatches(val, field.type)) {
+        _err(r, E.VALUE_TYPE_MISMATCH,
+          "Values[" + i + "][" + fi + "] (" + field.name + "): expected " + field.type + ", got " + typeof val + ".",
+          field.name, i);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 6a — 104-specific rules
+// ---------------------------------------------------------------------------
+
+const FORBIDDEN_CUSTOM_KEYS_104 = new Set(MANDATORY_KEYS);
+
+function _check104Specific(doc: BEJSONDocument, r: ValidationResult): void {
+  // Single record type
+  if (doc.Records_Type.length !== 1) {
+    _err(r, E.VERSION_CONSTRAINT, "BEJSON 104 requires exactly one Records_Type entry.", "Records_Type");
+  }
+
+  // No custom top-level keys (Parent_Hierarchy is the only exception)
+  for (const key of Object.keys(doc)) {
+    if (!FORBIDDEN_CUSTOM_KEYS_104.has(key as typeof MANDATORY_KEYS[number]) && key !== "Parent_Hierarchy") {
+      _err(r, E.FORBIDDEN_CUSTOM_KEY, "BEJSON 104 forbids custom top-level key: \"" + key + "\".", key);
+    }
+  }
+
+  // Parent_Hierarchy, if present, must be a string
+  if ("Parent_Hierarchy" in doc && typeof doc.Parent_Hierarchy !== "string") {
+    _err(r, E.VERSION_CONSTRAINT, "Parent_Hierarchy must be a string when present.", "Parent_Hierarchy");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 6b — 104a-specific rules
+// ---------------------------------------------------------------------------
+
+const PRIMITIVE_TYPES: BEJSONPrimitiveType[] = ["string", "integer", "number", "boolean"];
+const PASCAL_CASE_RE = /^[A-Z][A-Za-z0-9]*(_[A-Za-z0-9]+)*$/;
+
+function _check104aSpecific(doc: BEJSONDocument, r: ValidationResult): void {
+  // Single record type
+  if (doc.Records_Type.length !== 1) {
+    _err(r, E.VERSION_CONSTRAINT, "BEJSON 104a requires exactly one Records_Type entry.", "Records_Type");
+  }
+
+  // Fields must be primitive-only
+  for (let i = 0; i < doc.Fields.length; i++) {
+    const field = doc.Fields[i];
+    if (!PRIMITIVE_TYPES.includes(field.type as BEJSONPrimitiveType)) {
+      _err(r, E.VERSION_CONSTRAINT,
+        "BEJSON 104a: Fields[" + i + "].type \"" + field.type + "\" is not a primitive type.", field.name);
+    }
+  }
+
+  // Custom keys: must be PascalCase, must not collide with mandatory keys
+  for (const key of Object.keys(doc)) {
+    if (FORBIDDEN_CUSTOM_KEYS_104.has(key as typeof MANDATORY_KEYS[number])) continue;
+    if (key === "Parent_Hierarchy") {
+      // Parent_Hierarchy is not defined for 104a but not strictly forbidden;
+      // emit a warning rather than an error since the spec is silent here.
+      continue;
+    }
+    if (!PASCAL_CASE_RE.test(key)) {
+      _err(r, E.INVALID_CUSTOM_KEY,
+        "BEJSON 104a: custom header \"" + key + "\" must be PascalCase.", key);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 6c — 104db-specific rules
+// ---------------------------------------------------------------------------
+
+function _check104dbSpecific(doc: BEJSONDocument, r: ValidationResult): void {
+  // Two or more record types
+  if (doc.Records_Type.length < 2) {
+    _err(r, E.VERSION_CONSTRAINT, "BEJSON 104db requires at least two Records_Type entries.", "Records_Type");
+  }
+
+  // No custom top-level keys (not even Parent_Hierarchy)
+  for (const key of Object.keys(doc)) {
+    if (!FORBIDDEN_CUSTOM_KEYS_104.has(key as typeof MANDATORY_KEYS[number])) {
+      _err(r, E.FORBIDDEN_CUSTOM_KEY, "BEJSON 104db forbids custom top-level key: \"" + key + "\".", key);
+    }
+  }
+
+  // First field must be Record_Type_Parent: string
+  if (doc.Fields.length === 0 || doc.Fields[0].name !== "Record_Type_Parent") {
+    _err(r, E.MISSING_DISCRIMINATOR, "BEJSON 104db: first field must be named \"Record_Type_Parent\".", "Fields");
+    return; // can't continue safely
+  }
+  if (doc.Fields[0].type !== "string") {
+    _err(r, E.MISSING_DISCRIMINATOR, "BEJSON 104db: Record_Type_Parent field type must be \"string\".", "Record_Type_Parent");
+  }
+
+  // Every field except Record_Type_Parent must have Record_Type_Parent property
+  const validEntities = new Set(doc.Records_Type);
+  for (let i = 1; i < doc.Fields.length; i++) {
+    const field = doc.Fields[i];
+    if (!field.Record_Type_Parent) {
+      _err(r, E.MISSING_DISCRIMINATOR,
+        "BEJSON 104db: Fields[" + i + "] (\"" + field.name + "\") is missing Record_Type_Parent assignment.", field.name);
+    } else if (!validEntities.has(field.Record_Type_Parent)) {
+      _err(r, E.VERSION_CONSTRAINT,
+        "BEJSON 104db: Fields[" + i + "].Record_Type_Parent \"" + field.Record_Type_Parent + "\" is not in Records_Type.", field.name);
+    }
+  }
+
+  // Every record's discriminator must match a declared entity
+  if (Array.isArray(doc.Values)) {
+    for (let i = 0; i < doc.Values.length; i++) {
+      const row = doc.Values[i];
+      if (!Array.isArray(row) || row.length === 0) continue;
+      const discriminator = row[0];
+      if (typeof discriminator !== "string" || !validEntities.has(discriminator)) {
+        _err(r, E.VERSION_CONSTRAINT,
+          "Values[" + i + "][0] discriminator \"" + discriminator + "\" not in Records_Type.", "Record_Type_Parent", i);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Type matching helper
+// ---------------------------------------------------------------------------
+
+function _typeMatches(val: unknown, type: BEJSONFieldType): boolean {
+  if (val === null) return true;
+  switch (type) {
+    case "string":
+      return typeof val === "string";
+    case "integer":
+      return typeof val === "number" && Number.isInteger(val);
+    case "number":
+      return typeof val === "number";
+    case "boolean":
+      return typeof val === "boolean";
+    case "array":
+      return Array.isArray(val);
+    case "object":
+      return typeof val === "object" && !Array.isArray(val) && val !== null;
+    default:
+      return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Result helpers
+// ---------------------------------------------------------------------------
+
+function _makeResult(): ValidationResult {
+  return { valid: true, errors: [], warnings: [] };
+}
+
+function _err(
+  r: ValidationResult,
+  code: number,
+  message: string,
+  field?: string,
+  recordIndex?: number
+): void {
+  r.valid = false;
+  const e: ValidationError = { code, message };
+  if (field !== undefined) e.field = field;
+  if (recordIndex !== undefined) e.recordIndex = recordIndex;
+  r.errors.push(e);
+}
+
+function _warn(
+  r: ValidationResult,
+  code: number,
+  message: string,
+  field?: string,
+  recordIndex?: number
+): void {
+  const w: ValidationWarning = { code, message };
+  if (field !== undefined) w.field = field;
+  if (recordIndex !== undefined) w.recordIndex = recordIndex;
+  r.warnings.push(w);
+}
+
+// Export _warn so mfdb_validators can reuse the pattern
+export { _warn as _emitWarning, _err as _emitError, _makeResult };
+
+
+
+--- FILE: index.ts ---
+/**
+ * Library:     index.ts
+ * Jurisdiction: ["TYPESCRIPT", "CORE_COMMAND"]
+ * Status:      OFFICIAL — Core-Command/Lib (v1.1)
+ * Author:      Elton Boehnen
+ * Version:     1.1 (OFFICIAL)
+ * Date:        2026-04-23
+ * Description: Core-Command library component.
+ */
+// Types & error classes
+export * from "./bejson_types";
+
+// Core operations (parse, serialize, record CRUD)
+export * from "./bejson_core";
+
+// BEJSON validators (104, 104a, 104db)
+export {
+  validateDocument,
+  validate104,
+  validate104a,
+  validate104db,
+  assertValid,
+  isValid,
+} from "./bejson_validators";
+
+// MFDB validators
+export {
+  discoverRole,
+  validateManifest,
+  validateEntityFile,
+  validateDatabase,
+  decodeManifestRecords,
+  decodeDatabaseMeta,
+} from "./mfdb_validators";
+
+// MFDB core
+export {
+  createManifest,
+  createEntityFile,
+  registerEntity,
+  unregisterEntity,
+  syncRecordCount,
+  updateEntityRecord,
+  findEntityRecord,
+  listEntities,
+  listEntityPaths,
+} from "./mfdb_core";
+
+export type { CreateManifestOptions, EntityValidationOptions, DatabaseValidationOptions } from "./mfdb_validators";
+export type { CreateManifestOptions as MFDBCreateManifestOptions } from "./mfdb_core";
+
+
+
+--- FILE: mfdb_core.ts ---
+/**
+ * Library:     mfdb_core.ts
+ * Jurisdiction: ["TYPESCRIPT", "CORE_COMMAND"]
+ * Status:      OFFICIAL — Core-Command/Lib (v1.2)
+ * Author:      Elton Boehnen
+ * Version:     1.2 (OFFICIAL) Archive Transport Update
+ * Date:        2026-04-26
+ * Description: MFDB Core definitions for TypeScript.
+ *              v1.2 adds MFDBArchive support for .mfdb.zip handling.
+ */
+import {
+  BEJSONDocument,
+  BEJSONField,
+  BEJSONValue,
+  MFDBManifestRecord,
+  MFDBDatabaseMeta,
+  MFDBCoreError,
+  MFDB_CORE_CODES as E,
+} from "./bejson_types";
+import { decodeManifestRecords } from "./mfdb_validators";
+import {
+  appendRecord,
+  deleteRecord,
+  getFieldIndex,
+  setFieldValue,
+  createEmpty104a,
+  createEmpty104,
+} from "./bejson_core";
+
+// ---------------------------------------------------------------------------
+// MFDBArchive Interface (v1.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Handles .mfdb.zip packaging and virtual mounting using File System Access API.
+ */
+export interface MFDBArchiveInterface {
+  /**
+   * Mounts a .mfdb.zip file into a FileSystemDirectoryHandle.
+   */
+  mount(zipFile: File | Blob, dirHandle: any): Promise<string>;
+
+  /**
+   * Repacks a FileSystemDirectoryHandle back into a .mfdb.zip Blob.
+   */
+  commit(dirHandle: any): Promise<Blob>;
+}
+
+// ---------------------------------------------------------------------------
+// Manifest factory
+// ---------------------------------------------------------------------------
+
+export interface CreateManifestOptions extends MFDBDatabaseMeta {
+  includeOptionalFields?: boolean;
+}
+
+export function createManifest(opts: CreateManifestOptions): BEJSONDocument {
+  if (!opts.db_name || opts.db_name.trim() === "") {
+    throw new MFDBCoreError(E.MISSING_DB_NAME, "DB_Name is required when creating a manifest.");
+  }
+
+  const includeOptional = opts.includeOptionalFields !== false;
+
+  const fields: BEJSONField[] = [
+    { name: "entity_name", type: "string" },
+    { name: "file_path", type: "string" },
+  ];
+  if (includeOptional) {
+    fields.push(
+      { name: "description", type: "string" },
+      { name: "record_count", type: "integer" },
+      { name: "schema_version", type: "string" },
+      { name: "primary_key", type: "string" }
+    );
+  }
+
+  const customHeaders: Record<string, string> = {
+    MFDB_Version: opts.mfdb_version ?? "1.21",
+    DB_Name: opts.db_name,
+  };
+  if (opts.db_description) customHeaders["DB_Description"] = opts.db_description;
+  if (opts.schema_version) customHeaders["Schema_Version"] = opts.schema_version;
+  if (opts.author) customHeaders["Author"] = opts.author;
+  if (opts.created_at) customHeaders["Created_At"] = opts.created_at;
+
+  return createEmpty104a("mfdb", fields, customHeaders);
+}
+
+// ---------------------------------------------------------------------------
+// Entity registration
+// ---------------------------------------------------------------------------
+
+export function registerEntity(
+  manifest: BEJSONDocument,
+  record: MFDBManifestRecord
+): BEJSONDocument {
+  _assertManifest(manifest);
+
+  const existing = decodeManifestRecords(manifest);
+  if (existing.some((r) => r.entity_name === record.entity_name)) {
+    throw new MFDBCoreError(
+      E.DUPLICATE_ENTITY_NAME,
+      "Entity \"" + record.entity_name + "\" is already registered."
+    );
+  }
+
+  const fieldNames = manifest.Fields.map((f) => f.name);
+  const row: BEJSONValue[] = fieldNames.map((name) => {
+    switch (name) {
+      case "entity_name": return record.entity_name;
+      case "file_path": return record.file_path;
+      case "description": return record.description ?? null;
+      case "record_count": return record.record_count ?? null;
+      case "schema_version": return record.schema_version ?? null;
+      case "primary_key": return record.primary_key ?? null;
+      default: return null;
+    }
+  });
+
+  return appendRecord(manifest, row);
+}
+
+export function unregisterEntity(
+  manifest: BEJSONDocument,
+  entityName: string
+): BEJSONDocument {
+  _assertManifest(manifest);
+  const idx = _findEntityIndex(manifest, entityName);
+  return deleteRecord(manifest, idx);
+}
+
+export function syncRecordCount(
+  manifest: BEJSONDocument,
+  entityName: string,
+  count: number
+): BEJSONDocument {
+  _assertManifest(manifest);
+  const idx = _findEntityIndex(manifest, entityName);
+
+  try {
+    getFieldIndex(manifest, "record_count");
+  } catch {
+    throw new MFDBCoreError(
+      E.RECORD_COUNT_SYNC_FAILED,
+      "Manifest lacks \"record_count\" field."
+    );
+  }
+
+  return setFieldValue(manifest, idx, "record_count", count);
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+function _assertManifest(doc: BEJSONDocument): void {
+  if (!doc) {
+    throw new MFDBCoreError(E.NULL_MANIFEST, "Manifest is null or undefined.");
+  }
+}
+
+function _findEntityIndex(manifest: BEJSONDocument, entityName: string): number {
+  const enIdx = getFieldIndex(manifest, "entity_name");
+  for (let i = 0; i < manifest.Values.length; i++) {
+    if (manifest.Values[i][enIdx] === entityName) return i;
+  }
+  throw new MFDBCoreError(
+    E.ENTITY_NOT_IN_MANIFEST,
+    "Entity \"" + entityName + "\" not found."
+  );
+}
+
+
+
+--- FILE: mfdb_validators.ts ---
+/**
+ * Library:     mfdb_validators.ts
+ * Jurisdiction: ["TYPESCRIPT", "CORE_COMMAND"]
+ * Status:      OFFICIAL — Core-Command/Lib (v1.1)
+ * Author:      Elton Boehnen
+ * Version:     1.1 (OFFICIAL)
+ * Date:        2026-04-23
+ * Description: (obj["description"] as string | null) ?? null,
+      record_count: (obj["record_count"] as number | null) ?? null,
+      schema_version: (obj["schema_version"] as string | null) ?? null,
+      primary_key: (obj["primary_key"] as string | null) ?? null,
+    } as MFDBManifestRecord;
+  });
+}
+
+/**
+Extract database-level metadata from manifest custom headers.
+ */
+import {
+  BEJSONDocument,
+  BEJSONValue,
+  MFDBManifestRecord,
+  MFDBDatabaseMeta,
+  MFDBFileRole,
+  ValidationResult,
+  MFDBValidationError,
+  MFDB_VALIDATION_CODES as E,
+  MFDB_CORE_CODES,
+} from "./bejson_types";
+import { validateDocument as validateBEJSON } from "./bejson_validators";
+import { _emitError, _emitWarning, _makeResult } from "./bejson_validators";
+
+// ---------------------------------------------------------------------------
+// Discovery algorithm
+// ---------------------------------------------------------------------------
+
+
+export function discoverRole(doc: unknown, filename: string): MFDBFileRole {
+  if (doc === null || doc === undefined || typeof doc !== "object" || Array.isArray(doc)) {
+    return "standalone";
+  }
+  const d = doc as BEJSONDocument;
+  if (d.Format_Version === "104a" && filename.endsWith(".mfdb.bejson")) {
+    return "manifest";
+  }
+  if (d.Format_Version === "104" && "Parent_Hierarchy" in d) {
+    return "entity";
+  }
+  return "standalone";
+}
+
+// ---------------------------------------------------------------------------
+// Level 1 — Manifest validation
+// ---------------------------------------------------------------------------
+
+
+export function validateManifest(
+  doc: unknown,
+  options: {
+    
+    resolvedPaths?: Set<string>;
+  } = {}
+): ValidationResult {
+  const r = _makeResult();
+
+  // Must be valid BEJSON 104a
+  const bejsonResult = validateBEJSON(doc);
+  if (!bejsonResult.valid) {
+    for (const e of bejsonResult.errors) {
+      _emitError(r, e.code, "[BEJSON] " + e.message, e.field, e.recordIndex);
+    }
+    return r;
+  }
+
+  const manifest = doc as BEJSONDocument;
+
+  if (manifest.Format_Version !== "104a") {
+    _emitError(r, E.NOT_A_MANIFEST, "Manifest must be Format_Version \"104a\", got \"" + manifest.Format_Version + "\".");
+    return r;
+  }
+
+  // Records_Type must be exactly ["mfdb"]
+  if (
+    !Array.isArray(manifest.Records_Type) ||
+    manifest.Records_Type.length !== 1 ||
+    manifest.Records_Type[0] !== "mfdb"
+  ) {
+    _emitError(r, E.MANIFEST_RECORDS_TYPE_INVALID, "Manifest Records_Type must be exactly [\"mfdb\"].", "Records_Type");
+  }
+
+  // Required custom headers
+  if (typeof manifest["MFDB_Version"] !== "string" || (manifest["MFDB_Version"] as string).trim() === "") {
+    _emitError(r, MFDB_CORE_CODES.INVALID_MFDB_VERSION as unknown as number,
+      "Manifest is missing required header MFDB_Version.", "MFDB_Version");
+  }
+  if (typeof manifest["DB_Name"] !== "string" || (manifest["DB_Name"] as string).trim() === "") {
+    _emitError(r, MFDB_CORE_CODES.MISSING_DB_NAME as unknown as number,
+      "Manifest is missing required header DB_Name.", "DB_Name");
+  }
+
+  // entity_name and file_path field presence
+  const fieldNames = manifest.Fields.map((f) => f.name);
+  if (!fieldNames.includes("entity_name")) {
+    _emitError(r, E.MISSING_REQUIRED_MANIFEST_FIELD, "Manifest Fields must include \"entity_name\".", "entity_name");
+  }
+  if (!fieldNames.includes("file_path")) {
+    _emitError(r, E.MISSING_REQUIRED_MANIFEST_FIELD, "Manifest Fields must include \"file_path\".", "file_path");
+  }
+
+  if (!r.valid) return r; // can't proceed without required fields
+
+  const enIdx = fieldNames.indexOf("entity_name");
+  const fpIdx = fieldNames.indexOf("file_path");
+
+  const seenNames = new Set<string>();
+  const seenPaths = new Set<string>();
+
+  for (let i = 0; i < manifest.Values.length; i++) {
+    const row = manifest.Values[i];
+
+    const entityName = row[enIdx];
+    const filePath = row[fpIdx];
+
+    // Null checks
+    if (entityName === null) {
+      _emitError(r, E.NULL_IN_REQUIRED_MANIFEST_FIELD,
+        "Values[" + i + "].entity_name must not be null.", "entity_name", i);
+    }
+    if (filePath === null) {
+      _emitError(r, E.NULL_IN_REQUIRED_MANIFEST_FIELD,
+        "Values[" + i + "].file_path must not be null.", "file_path", i);
+    }
+
+    // Uniqueness
+    if (typeof entityName === "string") {
+      if (seenNames.has(entityName)) {
+        _emitError(r, E.DUPLICATE_ENTRY,
+          "Duplicate entity_name: \"" + entityName + "\".", "entity_name", i);
+      } else {
+        seenNames.add(entityName);
+      }
+    }
+    if (typeof filePath === "string") {
+      if (seenPaths.has(filePath)) {
+        _emitError(r, E.DUPLICATE_ENTRY,
+          "Duplicate file_path: \"" + filePath + "\".", "file_path", i);
+      } else {
+        seenPaths.add(filePath);
+      }
+
+      // File existence (optional — caller must provide resolvedPaths)
+      if (options.resolvedPaths && !options.resolvedPaths.has(filePath)) {
+        _emitError(r, E.ENTITY_FILE_NOT_FOUND,
+          "file_path \"" + filePath + "\" does not exist on disk.", "file_path", i);
+      }
+    }
+  }
+
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Level 2 — Entity file validation
+// ---------------------------------------------------------------------------
+
+export interface EntityValidationOptions {
+  
+  expectedEntityName: string;
+  
+  expectedParentHierarchy?: string;
+  
+  manifestRelativePath?: string;
+  
+  entityRelativePath?: string;
+}
+
+
+export function validateEntityFile(
+  doc: unknown,
+  options: EntityValidationOptions
+): ValidationResult {
+  const r = _makeResult();
+
+  // Must be valid BEJSON 104
+  const bejsonResult = validateBEJSON(doc);
+  if (!bejsonResult.valid) {
+    for (const e of bejsonResult.errors) {
+      _emitError(r, e.code, "[BEJSON] " + e.message, e.field, e.recordIndex);
+    }
+    return r;
+  }
+
+  const entity = doc as BEJSONDocument;
+
+  if (entity.Format_Version !== "104") {
+    _emitError(r, E.NOT_AN_ENTITY, "Entity file must be Format_Version \"104\", got \"" + entity.Format_Version + "\".");
+    return r;
+  }
+
+  // Parent_Hierarchy required
+  if (!("Parent_Hierarchy" in entity) || entity.Parent_Hierarchy === undefined || entity.Parent_Hierarchy === null) {
+    _emitError(r, E.MISSING_PARENT_HIERARCHY, "Entity file must contain Parent_Hierarchy key.", "Parent_Hierarchy");
+  } else if (typeof entity.Parent_Hierarchy !== "string" || entity.Parent_Hierarchy.trim() === "") {
+    _emitError(r, E.MISSING_PARENT_HIERARCHY, "Parent_Hierarchy must be a non-empty string.", "Parent_Hierarchy");
+  }
+
+  // Records_Type must be exactly one string
+  if (!Array.isArray(entity.Records_Type) || entity.Records_Type.length !== 1) {
+    _emitError(r, E.NOT_AN_ENTITY, "Entity file Records_Type must contain exactly one entry.", "Records_Type");
+    return r;
+  }
+
+  // Records_Type[0] must match the registered entity_name (case-sensitive)
+  const actualName = entity.Records_Type[0];
+  if (actualName !== options.expectedEntityName) {
+    _emitError(r, E.ENTITY_NAME_MISMATCH,
+      "Entity file Records_Type[0] is \"" + actualName + "\" but manifest expects \"" + options.expectedEntityName + "\".",
+      "Records_Type");
+  }
+
+  // Parent_Hierarchy path check (if caller provided expected value)
+  if (
+    options.expectedParentHierarchy !== undefined &&
+    typeof entity.Parent_Hierarchy === "string" &&
+    entity.Parent_Hierarchy !== options.expectedParentHierarchy
+  ) {
+    _emitError(r, E.MANIFEST_FILE_NOT_FOUND,
+      "Parent_Hierarchy \"" + entity.Parent_Hierarchy + "\" does not match expected \"" + options.expectedParentHierarchy + "\".",
+      "Parent_Hierarchy");
+  }
+
+  // Bidirectional check: entity's declared path must equal what the manifest recorded
+  if (options.entityRelativePath !== undefined && options.manifestRelativePath !== undefined) {
+    // The manifest says this entity lives at entityRelativePath.
+    // The entity's Parent_Hierarchy + its own path should resolve back to manifestRelativePath.
+    // We do a lightweight string-based check here — full path resolution is the caller's job.
+    // We emit a warning rather than an error because resolution is environment-dependent.
+    if (typeof entity.Parent_Hierarchy === "string") {
+      _emitWarning(r, E.BIDIRECTIONAL_PATH_FAILED,
+        "Bidirectional path check: verify that \"" + options.entityRelativePath +
+        "\" + Parent_Hierarchy \"" + entity.Parent_Hierarchy +
+        "\" resolves to manifest at \"" + options.manifestRelativePath + "\".",
+        "Parent_Hierarchy");
+    }
+  }
+
+  // No path escaping
+  if (typeof entity.Parent_Hierarchy === "string") {
+    if (entity.Parent_Hierarchy.includes("..") && _escapesRoot(entity.Parent_Hierarchy)) {
+      _emitError(r, E.MISSING_PARENT_HIERARCHY,
+        "Parent_Hierarchy must not escape the database root directory.", "Parent_Hierarchy");
+    }
+  }
+
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Level 3 — Database-wide validation
+// ---------------------------------------------------------------------------
+
+export interface DatabaseValidationOptions {
+  
+  strict?: boolean;
+  
+  resolvedPaths?: Set<string>;
+}
+
+
+export function validateDatabase(
+  manifest: unknown,
+  entityDocs: Map<string, unknown>,
+  options: DatabaseValidationOptions = {}
+): ValidationResult {
+  const r = _makeResult();
+
+  // Level 1
+  const l1 = validateManifest(manifest, { resolvedPaths: options.resolvedPaths });
+  for (const e of l1.errors) _emitError(r, e.code, "[L1] " + e.message, e.field, e.recordIndex);
+  for (const w of l1.warnings) _emitWarning(r, w.code, "[L1] " + w.message, w.field, w.recordIndex);
+  if (!r.valid) return r;
+
+  const manifestDoc = manifest as BEJSONDocument;
+  const records = decodeManifestRecords(manifestDoc);
+
+  // Level 2 — per entity
+  for (const record of records) {
+    const entityDoc = entityDocs.get(record.file_path);
+    if (!entityDoc) {
+      _emitError(r, E.ENTITY_FILE_NOT_FOUND,
+        "[L2] Entity document not provided for file_path \"" + record.file_path + "\".", "file_path");
+      continue;
+    }
+
+    const l2 = validateEntityFile(entityDoc, {
+      expectedEntityName: record.entity_name,
+      entityRelativePath: record.file_path,
+    });
+    for (const e of l2.errors) _emitError(r, e.code, "[L2:" + record.entity_name + "] " + e.message, e.field, e.recordIndex);
+    for (const w of l2.warnings) _emitWarning(r, w.code, "[L2:" + record.entity_name + "] " + w.message, w.field, w.recordIndex);
+  }
+
+  // Level 3 — record_count advisory check + FK resolution (warnings only unless strict)
+  if (r.valid) {
+    _checkRecordCounts(manifestDoc, records, entityDocs, r);
+    _checkFKResolution(records, entityDocs, options.strict === true, r);
+  }
+
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Helper — decode manifest Values into MFDBManifestRecord objects
+// ---------------------------------------------------------------------------
+
+
+export function decodeManifestRecords(manifest: BEJSONDocument): MFDBManifestRecord[] {
+  const fieldNames = manifest.Fields.map((f) => f.name);
+  return manifest.Values.map((row) => {
+    const obj: Record<string, BEJSONValue> = {};
+    for (let i = 0; i < fieldNames.length; i++) {
+      obj[fieldNames[i]] = row[i];
+    }
+    return {
+      entity_name: obj["entity_name"] as string,
+      file_path: obj["file_path"] as string,
+      description: (obj["description"] as string | null) ?? null,
+      record_count: (obj["record_count"] as number | null) ?? null,
+      schema_version: (obj["schema_version"] as string | null) ?? null,
+      primary_key: (obj["primary_key"] as string | null) ?? null,
+    } as MFDBManifestRecord;
+  });
+}
+
+
+export function decodeDatabaseMeta(manifest: BEJSONDocument): MFDBDatabaseMeta {
+  return {
+    mfdb_version: (manifest["MFDB_Version"] as string) ?? "",
+    db_name: (manifest["DB_Name"] as string) ?? "",
+    db_description: (manifest["DB_Description"] as string) ?? undefined,
+    schema_version: (manifest["Schema_Version"] as string) ?? undefined,
+    author: (manifest["Author"] as string) ?? undefined,
+    created_at: (manifest["Created_At"] as string) ?? undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Level 3 sub-checks
+// ---------------------------------------------------------------------------
+
+function _checkRecordCounts(
+  manifestDoc: BEJSONDocument,
+  records: MFDBManifestRecord[],
+  entityDocs: Map<string, unknown>,
+  r: ValidationResult
+): void {
+  const rcIdx = manifestDoc.Fields.findIndex((f) => f.name === "record_count");
+  if (rcIdx === -1) return; // field not declared — skip
+
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (record.record_count === null) continue;
+
+    const entityDoc = entityDocs.get(record.file_path) as BEJSONDocument | undefined;
+    if (!entityDoc) continue;
+
+    const actualCount = entityDoc.Values.length;
+    if (actualCount !== record.record_count) {
+      _emitWarning(r, 0,
+        "[L3] record_count mismatch for \"" + record.entity_name + "\": manifest says " +
+        record.record_count + ", file has " + actualCount + " rows.",
+        "record_count", i);
+    }
+  }
+}
+
+function _checkFKResolution(
+  records: MFDBManifestRecord[],
+  entityDocs: Map<string, unknown>,
+  strict: boolean,
+  r: ValidationResult
+): void {
+  // Build a map of primary_key field names to entity names
+  const pkMap = new Map<string, string>(); // pk_field → entity_name
+  for (const rec of records) {
+    if (rec.primary_key) {
+      pkMap.set(rec.primary_key, rec.entity_name);
+    }
+  }
+
+  // For each entity, find FK fields (ending in _fk) and try to resolve them
+  for (const rec of records) {
+    const entityDoc = entityDocs.get(rec.file_path) as BEJSONDocument | undefined;
+    if (!entityDoc) continue;
+
+    for (const field of entityDoc.Fields) {
+      if (!field.name.endsWith("_fk")) continue;
+
+      // Derive expected PK field name: strip _fk suffix
+      const expectedPK = field.name.slice(0, -3); // e.g. user_id_fk → user_id
+      if (!pkMap.has(expectedPK)) {
+        const msg = "[L3] FK field \"" + field.name + "\" in entity \"" + rec.entity_name +
+          "\" cannot resolve to any manifest primary_key \"" + expectedPK + "\".";
+        if (strict) {
+          _emitError(r, E.FK_UNRESOLVED, msg, field.name);
+        } else {
+          _emitWarning(r, E.FK_UNRESOLVED, msg, field.name);
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+
+
+function _escapesRoot(relPath: string): boolean {
+  const parts = relPath.replace(/\\/g, "/").split("/");
+  let depth = 0;
+  for (const part of parts) {
+    if (part === "..") {
+      depth--;
+      if (depth < 0) return true;
+    } else if (part !== "." && part !== "") {
+      depth++;
+    }
+  }
+  return false;
+}
+
+

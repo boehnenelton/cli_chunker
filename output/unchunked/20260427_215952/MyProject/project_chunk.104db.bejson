@@ -1,0 +1,82 @@
+{
+  "Format": "BEJSON",
+  "Format_Version": "104db",
+  "Format_Creator": "Elton Boehnen",
+  "Records_Type": [
+    "ProjectMeta",
+    "FileContent"
+  ],
+  "Fields": [
+    {
+      "name": "Record_Type_Parent",
+      "type": "string"
+    },
+    {
+      "name": "project_name",
+      "type": "string",
+      "Record_Type_Parent": "ProjectMeta"
+    },
+    {
+      "name": "version",
+      "type": "string",
+      "Record_Type_Parent": "ProjectMeta"
+    },
+    {
+      "name": "root_path",
+      "type": "string",
+      "Record_Type_Parent": "ProjectMeta"
+    },
+    {
+      "name": "file_path",
+      "type": "string",
+      "Record_Type_Parent": "FileContent"
+    },
+    {
+      "name": "file_name",
+      "type": "string",
+      "Record_Type_Parent": "FileContent"
+    },
+    {
+      "name": "content",
+      "type": "string",
+      "Record_Type_Parent": "FileContent"
+    },
+    {
+      "name": "is_binary",
+      "type": "boolean",
+      "Record_Type_Parent": "FileContent"
+    }
+  ],
+  "Values": [
+    [
+      "ProjectMeta",
+      "MyProject",
+      "1.0.0",
+      "/storage/emulated/0/dev/Projects/cli_chunker",
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      "FileContent",
+      null,
+      null,
+      null,
+      "project_rebuilder_template.104db.bejson",
+      "project_rebuilder_template.104db.bejson",
+      "{\n  \"Format\": \"BEJSON\",\n  \"Format_Version\": \"104db\",\n  \"Format_Creator\": \"Elton Boehnen\",\n  \"Records_Type\": [\n    \"ProjectMeta\",\n    \"FileContent\"\n  ],\n  \"Fields\": [\n    {\n      \"name\": \"Record_Type_Parent\",\n      \"type\": \"string\"\n    },\n    {\n      \"name\": \"project_name\",\n      \"type\": \"string\",\n      \"Record_Type_Parent\": \"ProjectMeta\"\n    },\n    {\n      \"name\": \"version\",\n      \"type\": \"string\",\n      \"Record_Type_Parent\": \"ProjectMeta\"\n    },\n    {\n      \"name\": \"root_path\",\n      \"type\": \"string\",\n      \"Record_Type_Parent\": \"ProjectMeta\"\n    },\n    {\n      \"name\": \"file_path\",\n      \"type\": \"string\",\n      \"Record_Type_Parent\": \"FileContent\"\n    },\n    {\n      \"name\": \"file_name\",\n      \"type\": \"string\",\n      \"Record_Type_Parent\": \"FileContent\"\n    },\n    {\n      \"name\": \"content\",\n      \"type\": \"string\",\n      \"Record_Type_Parent\": \"FileContent\"\n    },\n    {\n      \"name\": \"is_binary\",\n      \"type\": \"boolean\",\n      \"Record_Type_Parent\": \"FileContent\"\n    }\n  ],\n  \"Values\": [\n    [\n      \"ProjectMeta\",\n      \"My_Project\",\n      \"1.0.0\",\n      \"/path/to/project\",\n      null,\n      null,\n      null,\n      null\n    ],\n    [\n      \"FileContent\",\n      null,\n      null,\n      null,\n      \"src/main.py\",\n      \"main.py\",\n      \"print('hello')\",\n      false\n    ]\n  ]\n}\n",
+      false
+    ],
+    [
+      "FileContent",
+      null,
+      null,
+      null,
+      "chunker.py",
+      "chunker.py",
+      "#!/usr/bin/env python3\n\"\"\"\nCLI Chunker - Project to BEJSON 104db Packager\nDescription: Recursively scans a directory and packages file contents into \n             a standardized BEJSON 104db schema for transport and rebuilding.\n\"\"\"\nimport os\nimport sys\nimport json\nimport argparse\nfrom pathlib import Path\n\n# Setup local library path\nBASE_DIR = Path(__file__).resolve().parent\nsys.path.append(str(BASE_DIR / \"lib\"))\n\ntry:\n    import lib_bejson_core as BEJSONCore\nexcept ImportError:\n    print(\"CRITICAL: Local libraries not found in lib/\")\n    sys.exit(1)\n\nDEFAULT_CONFIG = {\n    \"project_name\": \"MyProject\",\n    \"version\": \"1.0.0\",\n    \"extensions\": [\".py\", \".js\", \".ts\", \".html\", \".css\", \".md\", \".json\", \".sh\", \".txt\", \".bejson\"],\n    \"exclude_dirs\": [\".git\", \"__pycache__\", \"node_modules\", \"lib\", \"output\", \".mfdb_lock\"],\n    \"output_file\": \"project_chunk.104db.bejson\"\n}\n\ndef load_or_create_config(target_path):\n    config_path = Path(target_path) / \"chunker_config.json\"\n    if config_path.exists():\n        try:\n            with open(config_path, \"r\") as f:\n                config = json.load(f)\n                # Merge with defaults for safety\n                for k, v in DEFAULT_CONFIG.items():\n                    if k not in config:\n                        config[k] = v\n                return config\n        except Exception as e:\n            print(f\"Warning: Failed to read config, using defaults. Error: {e}\")\n    \n    # Create default config if missing\n    try:\n        with open(config_path, \"w\") as f:\n            json.dump(DEFAULT_CONFIG, f, indent=2)\n        print(f\"[*] Created default config at {config_path}\")\n    except Exception as e:\n        print(f\"Warning: Could not create config file. Error: {e}\")\n        \n    return DEFAULT_CONFIG\n\ndef is_binary(file_path):\n    \"\"\"Simple check for binary files.\"\"\"\n    try:\n        with open(file_path, 'tr') as check_file:\n            check_file.read(512)\n            return False\n    except UnicodeDecodeError:\n        return True\n\ndef run_chunker(target_dir):\n    target_path = Path(target_dir).resolve()\n    if not target_path.is_dir():\n        print(f\"Error: {target_dir} is not a directory.\")\n        return\n\n    config = load_or_create_config(target_path)\n    exts = config[\"extensions\"]\n    excludes = config[\"exclude_dirs\"]\n    \n    print(f\"[*] Chunking project: {config['project_name']} (v{config['version']})\")\n    print(f\"[*] Target: {target_path}\")\n    \n    # BEJSON 104db Setup\n    records_types = [\"ProjectMeta\", \"FileContent\"]\n    fields = [\n        {\"name\": \"Record_Type_Parent\", \"type\": \"string\"},\n        {\"name\": \"project_name\", \"type\": \"string\", \"Record_Type_Parent\": \"ProjectMeta\"},\n        {\"name\": \"version\", \"type\": \"string\", \"Record_Type_Parent\": \"ProjectMeta\"},\n        {\"name\": \"root_path\", \"type\": \"string\", \"Record_Type_Parent\": \"ProjectMeta\"},\n        {\"name\": \"file_path\", \"type\": \"string\", \"Record_Type_Parent\": \"FileContent\"},\n        {\"name\": \"file_name\", \"type\": \"string\", \"Record_Type_Parent\": \"FileContent\"},\n        {\"name\": \"content\", \"type\": \"string\", \"Record_Type_Parent\": \"FileContent\"},\n        {\"name\": \"is_binary\", \"type\": \"boolean\", \"Record_Type_Parent\": \"FileContent\"}\n    ]\n    \n    values = []\n    \n    # 1. Add Meta Record\n    values.append([\n        \"ProjectMeta\",\n        config[\"project_name\"],\n        config[\"version\"],\n        str(target_path),\n        None, None, None, None\n    ])\n    \n    # 2. Scan Files\n    file_count = 0\n    for root, dirs, files in os.walk(target_path):\n        # Prune excluded directories\n        dirs[:] = [d for d in dirs if d not in excludes]\n        \n        for file in files:\n            f_path = Path(root) / file\n            if f_path.suffix.lower() in exts:\n                try:\n                    rel_path = f_path.relative_to(target_path)\n                    # Skip config file itself to avoid recursion bloat\n                    if file == \"chunker_config.json\" or file == config[\"output_file\"]:\n                        continue\n                        \n                    binary = is_binary(f_path)\n                    content = \"\"\n                    if not binary:\n                        with open(f_path, \"r\", encoding=\"utf-8\") as f:\n                            content = f.read()\n                    \n                    values.append([\n                        \"FileContent\",\n                        None, None, None,\n                        str(rel_path),\n                        file,\n                        content,\n                        binary\n                    ])\n                    file_count += 1\n                    print(f\"  [+] {rel_path}\")\n                except Exception as e:\n                    print(f\"  [-] Failed to process {file}: {e}\")\n\n    # 3. Create and Save BEJSON\n    doc = BEJSONCore.bejson_core_create_104db(records_types, fields, values)\n    output_path = target_path / config[\"output_file\"]\n    \n    try:\n        BEJSONCore.bejson_core_atomic_write(str(output_path), doc)\n        print(f\"\\n[SUCCESS] Project packed into {output_path}\")\n        print(f\"[*] Total Files: {file_count}\")\n    except Exception as e:\n        print(f\"\\n[ERROR] Failed to save BEJSON: {e}\")\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"BEJSON Project Chunker\")\n    parser.add_argument(\"directory\", nargs=\"?\", default=\".\", help=\"Directory to chunk (default: current)\")\n    \n    args = parser.parse_args()\n    run_chunker(args.directory)\n\nif __name__ == \"__main__\":\n    main()\n",
+      false
+    ]
+  ]
+}

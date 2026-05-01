@@ -1,0 +1,11 @@
+*.log
+*.log.*
+/data/temp/
+*.tmp
+*.temp
+.env
+.key
+keys.txt
+*_keys.bejson
+__pycache__/
+.DS_Store
